@@ -1,8 +1,11 @@
 package objectstorage
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
+	"crypto/sha256"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"os"
@@ -12,7 +15,10 @@ import (
 // DownloadTo writes an object into w. Objects above
 // Config.MultipartThreshold are fetched as Config.Concurrency parallel
 // ranges, each pinned to the object's ETag so a concurrent overwrite fails
-// the download instead of mixing two versions.
+// the download instead of mixing two versions. When the object has a
+// sha-256 Repr-Digest the data is checked against it (ErrDigestMismatch):
+// as it streams for a single request, and by reading the ranges back when
+// w is also an io.ReaderAt (a file) for a parallel download.
 func (b *Bucket) DownloadTo(ctx context.Context, key string, w io.WriterAt) (*Object, error) {
 	obj, err := b.Head(ctx, key)
 	if err != nil {
@@ -28,7 +34,22 @@ func (b *Bucket) DownloadTo(ctx context.Context, key string, w io.WriterAt) (*Ob
 		n := min(ps, obj.Size-off)
 		return b.downloadRange(ctx, key, obj.ETag, w, off, n)
 	})
-	return obj, err
+	if err != nil {
+		return obj, err
+	}
+	want := sha256Of(obj.Digest)
+	if ra, ok := w.(io.ReaderAt); ok && want != nil {
+		// The ranges arrived out of order: hash the whole object once
+		// they are all written.
+		h := sha256.New()
+		if _, err := io.Copy(h, io.NewSectionReader(ra, 0, obj.Size)); err != nil {
+			return obj, err
+		}
+		if got := h.Sum(nil); !bytes.Equal(got, want) {
+			return obj, fmt.Errorf("%w (%s: got sha-256 %s)", ErrDigestMismatch, key, base64.StdEncoding.EncodeToString(got))
+		}
+	}
+	return obj, nil
 }
 
 // downloadWhole streams a small object in one request and checks it
@@ -84,7 +105,8 @@ func (b *Bucket) DownloadFile(ctx context.Context, key, path string) (*Object, e
 		return nil, err
 	}
 	tmp := path + ".download"
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	// Read-write: a parallel download reads the file back to check its digest.
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, err
 	}

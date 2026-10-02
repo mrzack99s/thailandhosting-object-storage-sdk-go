@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -24,6 +25,11 @@ type Object struct {
 	LastModified time.Time         `json:"lastModified"`
 	ContentType  string            `json:"contentType,omitempty"`
 	Metadata     map[string]string `json:"metadata,omitempty"`
+	// Digest is the object's Repr-Digest (RFC 9530, "sha-256=:<base64>:")
+	// from Get and Head, when it was uploaded in one request with a
+	// digest; objects uploaded in parts have none. Full downloads are
+	// checked against it.
+	Digest string `json:"digest,omitempty"`
 }
 
 // PutOptions are the optional settings of an upload.
@@ -37,8 +43,50 @@ type PutOptions struct {
 	// (names are case-insensitive; at most 2 KB in all).
 	Metadata map[string]string
 	// IfNotExists fails the upload with code "precondition_failed" when
-	// the key already holds an object (single uploads only).
+	// the key already holds an object (If-None-Match: *).
 	IfNotExists bool
+	// IfMatch writes only if the key holds an object with one of these
+	// ETags (comma-separated; bare or quoted), or with any ETag for "*".
+	// IfNoneMatch writes only if it holds none of them ("*": only if the
+	// key is empty). The service checks them atomically with the write; a
+	// failed check is an error IsPreconditionFailed reports. Large uploads
+	// sent in parts are checked when the parts are joined (Complete).
+	IfMatch, IfNoneMatch string
+}
+
+// cond is the If-Match / If-None-Match of a write.
+func (o *PutOptions) cond() http.Header {
+	h := http.Header{}
+	if o == nil {
+		return h
+	}
+	if o.IfMatch != "" {
+		h.Set("If-Match", etagList(o.IfMatch))
+	}
+	if o.IfNoneMatch != "" {
+		h.Set("If-None-Match", etagList(o.IfNoneMatch))
+	} else if o.IfNotExists {
+		h.Set("If-None-Match", "*")
+	}
+	return h
+}
+
+// etagList quotes the bare ETags of an If-Match / If-None-Match value
+// (Object.ETag comes without quotes); "*" and quoted or weak tags stay.
+func etagList(v string) string {
+	v = strings.TrimSpace(v)
+	if v == "*" {
+		return v
+	}
+	tags := strings.Split(v, ",")
+	for i, t := range tags {
+		t = strings.TrimSpace(t)
+		if !strings.HasPrefix(t, `"`) && !strings.HasPrefix(t, "W/") {
+			t = `"` + t + `"`
+		}
+		tags[i] = t
+	}
+	return strings.Join(tags, ", ")
 }
 
 func (o *PutOptions) header() http.Header {
@@ -59,8 +107,8 @@ func (o *PutOptions) header() http.Header {
 	for k, v := range o.Metadata {
 		h.Set("X-Meta-"+k, v)
 	}
-	if o.IfNotExists {
-		h.Set("If-None-Match", "*")
+	for k, v := range o.cond() {
+		h[k] = v
 	}
 	return h
 }
@@ -93,10 +141,15 @@ func verifyETag(etag string, sum []byte) error {
 }
 
 // putSingle uploads size bytes in one request. open returns the body from
-// its start; it is called again for each retry.
+// its start; it is called once to compute the Content-Digest, then again
+// for each attempt.
 func (b *Bucket) putSingle(ctx context.Context, key string, open func() (io.Reader, error), size int64, opts *PutOptions) (*Object, error) {
+	digest, err := openDigest(open)
+	if err != nil {
+		return nil, err
+	}
 	var hr *hashingReader
-	resp, err := b.c.do(ctx, request{method: http.MethodPut, path: b.objectPath(key), header: opts.header(), size: size,
+	resp, err := b.c.do(ctx, request{method: http.MethodPut, path: b.objectPath(key), header: opts.header(), size: size, digest: digest,
 		body: func() (io.Reader, error) {
 			r, err := open()
 			if err != nil {
@@ -119,25 +172,45 @@ func (b *Bucket) putSingle(ctx context.Context, key string, open func() (io.Read
 	return &out, nil
 }
 
+// openDigest is the Content-Digest of the body open returns.
+func openDigest(open func() (io.Reader, error)) (string, error) {
+	r, err := open()
+	if err != nil {
+		return "", err
+	}
+	return readerDigest(r)
+}
+
 // PutBytes uploads data as one object.
 func (b *Bucket) PutBytes(ctx context.Context, key string, data []byte, opts *PutOptions) (*Object, error) {
 	return b.putSingle(ctx, key, func() (io.Reader, error) { return bytes.NewReader(data), nil }, int64(len(data)), opts)
 }
 
-// HeadOptions and GetOptions select what to download.
+// GetOptions select what to download (and, for HeadWithOptions, the
+// conditions; Offset and Length are ignored there).
 type GetOptions struct {
 	// Range downloads part of the object: bytes Offset..Offset+Length-1
 	// (Length 0: to the end).
 	Offset, Length int64
 	// IfNoneMatch makes Get return ErrNotModified when the object's ETag is
-	// this one (a cached copy is still current).
+	// this one (a cached copy is still current); comma-separated ETags or
+	// "*" also work.
 	IfNoneMatch string
-	// IfMatch fails the download with code "precondition_failed" unless
-	// the object's ETag is this one.
+	// IfMatch fails the download with an error IsPreconditionFailed
+	// reports unless the object's ETag is this one (or one of a
+	// comma-separated list).
 	IfMatch string
+	// IfModifiedSince makes Get return ErrNotModified unless the object
+	// changed after this time (ignored when IfNoneMatch is set).
+	IfModifiedSince time.Time
+	// IfUnmodifiedSince fails the download like IfMatch when the object
+	// changed after this time (ignored when IfMatch is set).
+	IfUnmodifiedSince time.Time
 }
 
-// ErrNotModified is returned by Get when GetOptions.IfNoneMatch matched.
+// ErrNotModified is returned by Get and HeadWithOptions when
+// GetOptions.IfNoneMatch or IfModifiedSince says the copy you have is
+// still current.
 var ErrNotModified = errors.New("objectstorage: not modified")
 
 // ObjectReader is a download in progress; Close it.
@@ -149,7 +222,7 @@ type ObjectReader struct {
 }
 
 func objectFromHeader(key string, h http.Header) Object {
-	o := Object{Key: key, ETag: strings.Trim(h.Get("ETag"), `"`), ContentType: h.Get("Content-Type")}
+	o := Object{Key: key, ETag: strings.Trim(h.Get("ETag"), `"`), ContentType: h.Get("Content-Type"), Digest: h.Get("Repr-Digest")}
 	if t, err := http.ParseTime(h.Get("Last-Modified")); err == nil {
 		o.LastModified = t
 	}
@@ -184,16 +257,24 @@ func (o *GetOptions) header() http.Header {
 		}
 	}
 	if o.IfNoneMatch != "" {
-		h.Set("If-None-Match", `"`+strings.Trim(o.IfNoneMatch, `"`)+`"`)
+		h.Set("If-None-Match", etagList(o.IfNoneMatch))
 	}
 	if o.IfMatch != "" {
-		h.Set("If-Match", `"`+strings.Trim(o.IfMatch, `"`)+`"`)
+		h.Set("If-Match", etagList(o.IfMatch))
+	}
+	if !o.IfModifiedSince.IsZero() {
+		h.Set("If-Modified-Since", o.IfModifiedSince.UTC().Format(http.TimeFormat))
+	}
+	if !o.IfUnmodifiedSince.IsZero() {
+		h.Set("If-Unmodified-Since", o.IfUnmodifiedSince.UTC().Format(http.TimeFormat))
 	}
 	return h
 }
 
 // Get streams an object (or a range of it). Object.Size is the whole
-// object's size. Close the reader.
+// object's size. Close the reader. A whole-object download with a
+// Repr-Digest is checked as it is read: the Read that reaches the end
+// fails with ErrDigestMismatch if the bytes differ.
 func (b *Bucket) Get(ctx context.Context, key string, opts *GetOptions) (*ObjectReader, error) {
 	resp, err := b.c.do(ctx, request{method: http.MethodGet, path: b.objectPath(key), header: opts.header(), expect: []int{200, 206, 304}})
 	if err != nil {
@@ -203,7 +284,12 @@ func (b *Bucket) Get(ctx context.Context, key string, opts *GetOptions) (*Object
 		resp.Body.Close()
 		return nil, ErrNotModified
 	}
-	return &ObjectReader{ReadCloser: resp.Body, Object: objectFromHeader(key, resp.Header), ContentRange: resp.Header.Get("Content-Range")}, nil
+	obj := objectFromHeader(key, resp.Header)
+	var body io.ReadCloser = resp.Body
+	if want := sha256Of(obj.Digest); want != nil && resp.StatusCode == http.StatusOK {
+		body = &verifyingReader{ReadCloser: resp.Body, h: sha256.New(), want: want, key: key}
+	}
+	return &ObjectReader{ReadCloser: body, Object: obj, ContentRange: resp.Header.Get("Content-Range")}, nil
 }
 
 // GetBytes downloads a whole object into memory.
@@ -222,11 +308,23 @@ func (b *Bucket) GetBytes(ctx context.Context, key string) ([]byte, error) {
 
 // Head returns an object's details without its data.
 func (b *Bucket) Head(ctx context.Context, key string) (*Object, error) {
-	resp, err := b.c.do(ctx, request{method: http.MethodHead, path: b.objectPath(key)})
+	return b.HeadWithOptions(ctx, key, nil)
+}
+
+// HeadWithOptions is Head with GetOptions' conditions: ErrNotModified when
+// IfNoneMatch / IfModifiedSince say your copy is current, an error
+// IsPreconditionFailed reports when IfMatch / IfUnmodifiedSince fail.
+func (b *Bucket) HeadWithOptions(ctx context.Context, key string, opts *GetOptions) (*Object, error) {
+	h := opts.header()
+	h.Del("Range")
+	resp, err := b.c.do(ctx, request{method: http.MethodHead, path: b.objectPath(key), header: h, expect: []int{200, 304}})
 	if err != nil {
 		return nil, err
 	}
 	resp.Body.Close()
+	if resp.StatusCode == http.StatusNotModified {
+		return nil, ErrNotModified
+	}
 	o := objectFromHeader(key, resp.Header)
 	return &o, nil
 }
@@ -242,7 +340,26 @@ func (b *Bucket) Exists(ctx context.Context, key string) (bool, error) {
 
 // Delete deletes an object; deleting a missing one succeeds.
 func (b *Bucket) Delete(ctx context.Context, key string) error {
-	resp, err := b.c.do(ctx, request{method: http.MethodDelete, path: b.objectPath(key)})
+	return b.DeleteWithOptions(ctx, key, nil)
+}
+
+// DeleteOptions are the conditions of a delete.
+type DeleteOptions struct {
+	// IfMatch deletes only if the object's ETag is one of these
+	// (comma-separated) or, for "*", if it exists at all; a missing object
+	// then fails too. IfNoneMatch deletes only if it is none of them. A
+	// failed check is an error IsPreconditionFailed reports.
+	IfMatch, IfNoneMatch string
+}
+
+// DeleteWithOptions deletes an object if opts' conditions hold. They are
+// checked atomically with the delete.
+func (b *Bucket) DeleteWithOptions(ctx context.Context, key string, opts *DeleteOptions) error {
+	h := http.Header{}
+	if opts != nil {
+		h = (&PutOptions{IfMatch: opts.IfMatch, IfNoneMatch: opts.IfNoneMatch}).cond()
+	}
+	resp, err := b.c.do(ctx, request{method: http.MethodDelete, path: b.objectPath(key), header: h})
 	if err != nil {
 		return err
 	}

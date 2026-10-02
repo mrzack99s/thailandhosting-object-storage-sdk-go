@@ -33,6 +33,11 @@ type MultipartUpload struct {
 	b   *Bucket
 	ID  string `json:"uploadId"`
 	Key string `json:"key"`
+	// IfMatch and IfNoneMatch are checked when Complete joins the parts
+	// (see PutOptions); CreateMultipartUpload copies them from its
+	// PutOptions, IfNotExists included.
+	IfMatch     string `json:"-"`
+	IfNoneMatch string `json:"-"`
 }
 
 // CreateMultipartUpload starts a multipart upload of key.
@@ -52,6 +57,8 @@ func (b *Bucket) CreateMultipartUpload(ctx context.Context, key string, opts *Pu
 	if err := b.c.doJSON(ctx, http.MethodPost, b.path+"/uploads", nil, in, u, true); err != nil {
 		return nil, err
 	}
+	cond := opts.cond()
+	u.IfMatch, u.IfNoneMatch = cond.Get("If-Match"), cond.Get("If-None-Match")
 	return u, nil
 }
 
@@ -76,8 +83,14 @@ func (u *MultipartUpload) UploadPartFrom(ctx context.Context, n int, r io.Reader
 }
 
 func (u *MultipartUpload) uploadPart(ctx context.Context, n int, open func() (io.Reader, error), size int64) (Part, error) {
+	// Each part carries its own Content-Digest: a buffer, or a section of
+	// a file read once more to hash it.
+	digest, err := openDigest(open)
+	if err != nil {
+		return Part{}, err
+	}
 	var hr *hashingReader
-	resp, err := u.b.c.do(ctx, request{method: http.MethodPut, path: u.path() + "/parts/" + strconv.Itoa(n), size: size,
+	resp, err := u.b.c.do(ctx, request{method: http.MethodPut, path: u.path() + "/parts/" + strconv.Itoa(n), size: size, digest: digest,
 		header: http.Header{"Content-Type": {"application/octet-stream"}},
 		body: func() (io.Reader, error) {
 			r, err := open()
@@ -112,7 +125,8 @@ func (u *MultipartUpload) Parts(ctx context.Context) ([]Part, error) {
 }
 
 // Complete joins the parts into the object. With parts nil, every part
-// received is used, in order.
+// received is used, in order. IfMatch / IfNoneMatch, when set, are checked
+// atomically with the join.
 func (u *MultipartUpload) Complete(ctx context.Context, parts []Part) (*Object, error) {
 	var in any
 	if parts != nil {
@@ -125,7 +139,8 @@ func (u *MultipartUpload) Complete(ctx context.Context, parts []Part) (*Object, 
 		in = map[string]any{"parts": list}
 	}
 	var out Object
-	err := u.b.c.doJSON(ctx, http.MethodPost, u.path()+"/complete", nil, in, &out, true)
+	h := (&PutOptions{IfMatch: u.IfMatch, IfNoneMatch: u.IfNoneMatch}).cond()
+	err := u.b.c.doJSONRequest(ctx, request{method: http.MethodPost, path: u.path() + "/complete", header: h, retryPOST: true}, in, &out)
 	if IsNotFound(err) {
 		// A retry after a completion whose answer was lost: the upload is
 		// gone because it became the object.
@@ -170,8 +185,10 @@ func (c *Client) partSizeFor(size int64) int64 {
 // not known (a pipe, a network stream). Up to Config.MultipartThreshold the
 // object goes in one request; above it, in parts of Config.PartSize sent
 // Config.Concurrency at a time, holding at most Concurrency+1 parts in
-// memory. An io.ReadSeeker is read again from its start on a retry; other
-// readers are buffered part by part so parts can be retried.
+// memory. An io.ReadSeeker is read once to compute the body's digest and
+// again from its start for each attempt; other readers are buffered (the
+// whole object up to the threshold, part by part above it) so the digest
+// is known before sending and parts can be retried.
 func (b *Bucket) Upload(ctx context.Context, key string, r io.Reader, size int64, opts *PutOptions) (*Object, error) {
 	opts = withContentType(opts, key)
 	if size >= 0 && size <= b.c.threshold {

@@ -25,6 +25,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -39,8 +40,10 @@ const Version = "1.0.0"
 type Config struct {
 	// Endpoint is the region's Object Storage endpoint, for example
 	// https://objects.bkk.thailandhosting.com.
-	Endpoint        string
-	AccessKeyID     string
+	Endpoint    string
+	AccessKeyID string
+	// SecretAccessKey signs every request (HTTP Message Signatures, RFC
+	// 9421, HMAC-SHA256); it is never sent.
 	SecretAccessKey string
 
 	// HTTPClient replaces the default client (a pooled, HTTP/2-capable
@@ -133,13 +136,18 @@ func defaultTransport() *http.Transport {
 	return t
 }
 
-// Error is an error answer from the service.
+// Error is an error answer from the service, read from its Problem
+// Details (RFC 9457).
 type Error struct {
 	StatusCode int
 	// Code is the machine-readable reason, for example "object_not_found",
 	// "bucket_already_exists" or "busy".
-	Code    string
+	Code string
+	// Message is the human-readable title.
 	Message string
+	// Type is the problem type URI and Instance the path it happened on
+	// (empty for HEAD requests, whose answers have no body).
+	Type, Instance string
 }
 
 func (e *Error) Error() string {
@@ -150,6 +158,14 @@ func (e *Error) Error() string {
 func IsNotFound(err error) bool {
 	var e *Error
 	return errors.As(err, &e) && e.StatusCode == http.StatusNotFound
+}
+
+// IsPreconditionFailed reports whether err means an If-Match /
+// If-None-Match (or If-Unmodified-Since) condition did not hold: the object
+// was not written, deleted or downloaded. It is never retried.
+func IsPreconditionFailed(err error) bool {
+	var e *Error
+	return errors.As(err, &e) && (e.StatusCode == http.StatusPreconditionFailed || e.Code == "precondition_failed")
 }
 
 // ErrorCode returns the service's error code of err, or "".
@@ -179,6 +195,9 @@ type request struct {
 	header http.Header
 	body   func() (io.Reader, error)
 	size   int64 // body length; -1 when unknown
+	// digest is the body's Content-Digest (contentDigest), required with a
+	// body: it is signed, and the service checks the bytes against it.
+	digest string
 	// retryPOST allows retrying a POST on answers that mean nothing was
 	// done (busy, rate limited).
 	retryPOST bool
@@ -248,10 +267,14 @@ func (c *Client) do(ctx context.Context, r request) (*http.Response, error) {
 		for k, v := range r.header {
 			req.Header[k] = v
 		}
-		if c.keyID != "" {
-			req.Header.Set("Authorization", "Bearer "+c.keyID+":"+c.secret)
+		if r.body != nil && r.digest != "" {
+			req.Header.Set("Content-Digest", r.digest)
 		}
 		req.Header.Set("User-Agent", c.userAgent)
+		if c.keyID != "" {
+			// Signed afresh on every attempt: created must be recent.
+			signRequest(req, c.keyID, c.secret, time.Now())
+		}
 		resp, err := c.http.Do(req)
 		canRetry := attempt < c.retries && ctx.Err() == nil
 		if err != nil {
@@ -268,12 +291,7 @@ func (c *Client) do(ctx context.Context, r request) (*http.Response, error) {
 		}
 		apiErr := readError(resp)
 		if canRetry && retryableStatus(resp.StatusCode, r.method, r.retryPOST) {
-			wait := backoff(attempt)
-			if ra := resp.Header.Get("Retry-After"); ra != "" {
-				if s, err := time.ParseDuration(ra + "s"); err == nil && s < 30*time.Second {
-					wait = max(wait, s)
-				}
-			}
+			wait := max(backoff(attempt), retryAfter(resp.Header.Get("Retry-After")))
 			if err := sleep(ctx, wait); err != nil {
 				return nil, err
 			}
@@ -281,6 +299,22 @@ func (c *Client) do(ctx context.Context, r request) (*http.Response, error) {
 		}
 		return nil, apiErr
 	}
+}
+
+// retryAfter is how long a Retry-After field (seconds or an HTTP date)
+// asks to wait, at most 30 seconds; 0 when absent or unreadable.
+func retryAfter(v string) time.Duration {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0
+	}
+	var d time.Duration
+	if s, err := strconv.Atoi(v); err == nil {
+		d = time.Duration(s) * time.Second
+	} else if t, err := http.ParseTime(v); err == nil {
+		d = time.Until(t)
+	}
+	return min(max(d, 0), 30*time.Second)
 }
 
 // isConnRefused reports a dial failure: the request never left, so even a
@@ -306,14 +340,22 @@ func readError(resp *http.Response) *Error {
 	defer resp.Body.Close()
 	e := &Error{StatusCode: resp.StatusCode, Code: resp.Header.Get("X-Error-Code"), Message: http.StatusText(resp.StatusCode)}
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	// Problem Details (RFC 9457); HEAD answers have no body, only
+	// X-Error-Code.
 	var doc struct {
-		Error struct {
-			Code    string `json:"code"`
-			Message string `json:"message"`
-		} `json:"error"`
+		Type     string `json:"type"`
+		Title    string `json:"title"`
+		Code     string `json:"code"`
+		Instance string `json:"instance"`
 	}
-	if json.Unmarshal(data, &doc) == nil && doc.Error.Code != "" {
-		e.Code, e.Message = doc.Error.Code, doc.Error.Message
+	if json.Unmarshal(data, &doc) == nil {
+		if doc.Code != "" {
+			e.Code = doc.Code
+		}
+		if doc.Title != "" {
+			e.Message = doc.Title
+		}
+		e.Type, e.Instance = doc.Type, doc.Instance
 	}
 	if e.Code == "" {
 		e.Code = strings.ToLower(strings.ReplaceAll(http.StatusText(resp.StatusCode), " ", "_"))
@@ -323,7 +365,11 @@ func readError(resp *http.Response) *Error {
 
 // doJSON sends in (if any) as JSON and decodes the answer into out (if any).
 func (c *Client) doJSON(ctx context.Context, method, path string, q url.Values, in, out any, retryPOST bool) error {
-	r := request{method: method, path: path, query: q, retryPOST: retryPOST}
+	return c.doJSONRequest(ctx, request{method: method, path: path, query: q, retryPOST: retryPOST}, in, out)
+}
+
+// doJSONRequest is doJSON for a request that carries headers of its own.
+func (c *Client) doJSONRequest(ctx context.Context, r request, in, out any) error {
 	if in != nil {
 		data, err := json.Marshal(in)
 		if err != nil {
@@ -331,7 +377,11 @@ func (c *Client) doJSON(ctx context.Context, method, path string, q url.Values, 
 		}
 		r.body = func() (io.Reader, error) { return bytes.NewReader(data), nil }
 		r.size = int64(len(data))
-		r.header = http.Header{"Content-Type": {"application/json"}}
+		r.digest = contentDigest(data)
+		if r.header == nil {
+			r.header = http.Header{}
+		}
+		r.header.Set("Content-Type", "application/json")
 	}
 	resp, err := c.do(ctx, r)
 	if err != nil {

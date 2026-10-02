@@ -3,8 +3,10 @@ package objectstorage
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/md5"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -26,22 +28,28 @@ import (
 )
 
 // fakeService is an in-memory implementation of the /v1 API, enough to
-// exercise the SDK offline.
+// exercise the SDK offline. It checks request signatures and body digests
+// the way the service does, and answers errors as Problem Details.
 type fakeService struct {
-	mu        sync.Mutex
-	objects   map[string][]byte // bucket/key
-	types     map[string]string
-	uploads   map[string]map[int][]byte
-	public    map[string][]PublicRule // bucket: what anyone may read
-	flaky     atomic.Int32            // answer 503 to this many requests first
-	corrupt   atomic.Bool             // store one byte wrong
-	inflight  atomic.Int32
-	maxFlight atomic.Int32
-	requests  atomic.Int32
+	mu         sync.Mutex
+	objects    map[string][]byte // bucket/key
+	types      map[string]string
+	digests    map[string]string // bucket/key: Repr-Digest of single uploads
+	uploads    map[string]map[int][]byte
+	public     map[string][]PublicRule // bucket: what anyone may read
+	flaky      atomic.Int32            // answer 503 to this many requests first
+	retryAfter string                  // Retry-After sent with those 503s
+	corrupt    atomic.Bool             // store one byte wrong
+	badRepr    atomic.Bool             // serve objects with a wrong Repr-Digest
+	inflight   atomic.Int32
+	maxFlight  atomic.Int32
+	requests   atomic.Int32
+	digested   atomic.Int32 // requests with a body that carried a valid Content-Digest
+	bearer     atomic.Bool  // an Authorization header was seen
 }
 
 func newFake() *fakeService {
-	return &fakeService{objects: map[string][]byte{}, types: map[string]string{}, uploads: map[string]map[int][]byte{}, public: map[string][]PublicRule{}}
+	return &fakeService{objects: map[string][]byte{}, types: map[string]string{}, digests: map[string]string{}, uploads: map[string]map[int][]byte{}, public: map[string][]PublicRule{}}
 }
 
 func md5hex(b []byte) string { s := md5.Sum(b); return hex.EncodeToString(s[:]) }
@@ -52,8 +60,103 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	json.NewEncoder(w).Encode(v)
 }
 
-func fail(w http.ResponseWriter, status int, code string) {
-	writeJSON(w, status, map[string]any{"error": map[string]string{"code": code, "message": code}})
+// fail answers an error as the service does: Problem Details (RFC 9457),
+// and only X-Error-Code for HEAD.
+func fail(w http.ResponseWriter, r *http.Request, status int, code string) {
+	w.Header().Set("X-Error-Code", code)
+	if r.Method == http.MethodHead {
+		w.WriteHeader(status)
+		return
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(map[string]any{"type": "tag:thailandhosting.com,2026:object-storage/" + code,
+		"title": "fake: " + code, "status": status, "code": code, "instance": r.URL.Path})
+}
+
+const testSecret = "SECRET"
+
+// verifySignature checks an HTTP Message Signature as the service does:
+// rebuild the signature base from the request as it arrived and compare
+// the HMAC. It returns "" when the signature is good.
+func verifySignature(r *http.Request, now time.Time) string {
+	input := r.Header.Get("Signature-Input")
+	inner, ok := strings.CutPrefix(input, "th=(")
+	if !ok {
+		return "Signature-Input is not th=(...)"
+	}
+	list, paramStr, ok := strings.Cut(inner, ")")
+	if !ok {
+		return "unterminated inner list"
+	}
+	var components []string
+	for _, c := range strings.Fields(list) {
+		components = append(components, strings.Trim(c, `"`))
+	}
+	var created int64
+	var keyID, alg string
+	for _, p := range strings.Split(strings.TrimPrefix(paramStr, ";"), ";") {
+		k, v, _ := strings.Cut(p, "=")
+		switch k {
+		case "created":
+			created, _ = strconv.ParseInt(v, 10, 64)
+		case "keyid":
+			keyID = strings.Trim(v, `"`)
+		case "alg":
+			alg = strings.Trim(v, `"`)
+		}
+	}
+	// Our profile: exactly these parameters, in this order.
+	canonical := fmt.Sprintf(`(%s);created=%d;keyid="%s";alg="hmac-sha256"`, list, created, keyID)
+	if input != "th="+canonical {
+		return "parameters are not created, keyid, alg: " + input
+	}
+	if keyID != "KEY" || alg != "hmac-sha256" {
+		return "unknown key or alg"
+	}
+	if d := now.Sub(time.Unix(created, 0)); d > 5*time.Minute || d < -5*time.Minute {
+		return "created is too far from our clock"
+	}
+	covered := map[string]bool{}
+	for _, c := range components {
+		covered[c] = true
+	}
+	for _, need := range []string{"@method", "@authority", "@path", "@query"} {
+		if !covered[need] {
+			return "does not cover " + need
+		}
+	}
+	if r.ContentLength != 0 && !covered["content-digest"] {
+		return "a body without a signed Content-Digest"
+	}
+	var base strings.Builder
+	for _, c := range components {
+		var v string
+		switch c {
+		case "@method":
+			v = r.Method
+		case "@authority":
+			v = strings.TrimSuffix(strings.TrimSuffix(strings.ToLower(r.Host), ":443"), ":80")
+		case "@path":
+			v = r.URL.EscapedPath()
+		case "@query":
+			v = "?" + r.URL.RawQuery
+		default:
+			if r.Header.Get(c) == "" {
+				return "the request has no " + c
+			}
+			v = r.Header.Get(c)
+		}
+		base.WriteString(`"` + c + `": ` + v + "\n")
+	}
+	base.WriteString(`"@signature-params": ` + canonical)
+	mac := hmac.New(sha256.New, []byte(testSecret))
+	mac.Write([]byte(base.String()))
+	want := "th=:" + base64.StdEncoding.EncodeToString(mac.Sum(nil)) + ":"
+	if r.Header.Get("Signature") != want {
+		return "signature does not match"
+	}
+	return ""
 }
 
 func (f *fakeService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -66,13 +169,34 @@ func (f *fakeService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
-	if r.Header.Get("Authorization") != "Bearer KEY:SECRET" && !f.publicRead(r) {
-		fail(w, 401, "unauthorized")
+	if r.Header.Get("Authorization") != "" {
+		f.bearer.Store(true)
+	}
+	if r.Header.Get("Signature-Input") != "" {
+		if why := verifySignature(r, time.Now()); why != "" {
+			w.Header().Set("Accept-Signature", `th=("@method" "@authority" "@path" "@query" "content-digest");alg="hmac-sha256"`)
+			fail(w, r, 401, "invalid_signature")
+			return
+		}
+	} else if !f.publicRead(r) {
+		fail(w, r, 401, "unauthorized")
 		return
+	}
+	if cd := r.Header.Get("Content-Digest"); cd != "" {
+		body, _ := io.ReadAll(r.Body)
+		if sum := sha256.Sum256(body); cd != "sha-256=:"+base64.StdEncoding.EncodeToString(sum[:])+":" {
+			fail(w, r, 400, "bad_digest")
+			return
+		}
+		f.digested.Add(1)
+		r.Body = io.NopCloser(bytes.NewReader(body))
 	}
 	if f.flaky.Load() > 0 && f.flaky.Add(-1) >= 0 {
 		io.Copy(io.Discard, r.Body)
-		fail(w, 503, "busy")
+		if f.retryAfter != "" {
+			w.Header().Set("Retry-After", f.retryAfter)
+		}
+		fail(w, r, 503, "busy")
 		return
 	}
 	time.Sleep(2 * time.Millisecond) // lets parallel requests overlap
@@ -98,14 +222,14 @@ func (f *fakeService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case len(parts) >= 2 && parts[1] == "uploads":
 		f.upload(w, r, bucket, parts)
 	default:
-		fail(w, 404, "not_found")
+		fail(w, r, 404, "not_found")
 	}
 }
 
 // publicRead reports an unsigned GET or HEAD of an object a bucket made
 // public.
 func (f *fakeService) publicRead(r *http.Request) bool {
-	if r.Header.Get("Authorization") != "" || r.Method != http.MethodGet && r.Method != http.MethodHead {
+	if r.Header.Get("Signature-Input") != "" || r.Method != http.MethodGet && r.Method != http.MethodHead {
 		return false
 	}
 	parts := strings.SplitN(strings.TrimPrefix(r.URL.EscapedPath(), "/v1/buckets/"), "/", 3)
@@ -123,39 +247,87 @@ func (f *fakeService) publicRead(r *http.Request) bool {
 	return false
 }
 
+// fakeModified is every fake object's Last-Modified.
+var fakeModified = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+// tagListed reports whether an If-Match / If-None-Match value lists etag
+// (quoted) or is "*".
+func tagListed(v, etag string) bool {
+	for _, t := range strings.Split(v, ",") {
+		if t = strings.TrimSpace(t); t == "*" || t == etag {
+			return true
+		}
+	}
+	return false
+}
+
+// writeCondFails applies If-Match / If-None-Match to a write (RFC 9110).
+func writeCondFails(r *http.Request, exists bool, etag string) bool {
+	if m := r.Header.Get("If-Match"); m != "" && (!exists || !tagListed(m, etag)) {
+		return true
+	}
+	if m := r.Header.Get("If-None-Match"); m != "" && exists && tagListed(m, etag) {
+		return true
+	}
+	return false
+}
+
 func (f *fakeService) object(w http.ResponseWriter, r *http.Request, id, key string) {
 	f.mu.Lock()
 	data, ok := f.objects[id]
-	ct := f.types[id]
+	ct, repr := f.types[id], f.digests[id]
 	f.mu.Unlock()
+	etag := `"` + md5hex(data) + `"`
 	switch r.Method {
 	case http.MethodPut:
 		body, _ := io.ReadAll(r.Body)
 		if int64(len(body)) != r.ContentLength {
-			fail(w, 400, "incomplete_body")
+			fail(w, r, 400, "incomplete_body")
 			return
 		}
 		if f.corrupt.Load() && len(body) > 0 {
 			body[0] ^= 1 // damaged on the way: the ETag is of what arrived
 		}
-		etag := md5hex(body)
 		f.mu.Lock()
-		f.objects[id], f.types[id] = body, r.Header.Get("Content-Type")
-		f.mu.Unlock()
-		writeJSON(w, 200, map[string]any{"key": key, "size": len(body), "etag": etag})
-	case http.MethodGet, http.MethodHead:
-		if !ok {
-			fail(w, 404, "object_not_found")
+		old, exists := f.objects[id]
+		if writeCondFails(r, exists, `"`+md5hex(old)+`"`) {
+			f.mu.Unlock()
+			fail(w, r, 412, "precondition_failed")
 			return
 		}
-		etag := `"` + md5hex(data) + `"`
-		if m := r.Header.Get("If-Match"); m != "" && m != etag {
-			fail(w, 412, "precondition_failed")
+		f.objects[id], f.types[id], f.digests[id] = body, r.Header.Get("Content-Type"), r.Header.Get("Content-Digest")
+		f.mu.Unlock()
+		writeJSON(w, 200, map[string]any{"key": key, "size": len(body), "etag": md5hex(body)})
+	case http.MethodGet, http.MethodHead:
+		if !ok {
+			fail(w, r, 404, "object_not_found")
 			return
 		}
 		w.Header().Set("ETag", etag)
+		w.Header().Set("Last-Modified", fakeModified.Format(http.TimeFormat))
+		if repr != "" {
+			if f.badRepr.Load() {
+				repr = contentDigest([]byte("something else"))
+			}
+			w.Header().Set("Repr-Digest", repr)
+		}
+		if m := r.Header.Get("If-Match"); m != "" && !tagListed(m, etag) {
+			fail(w, r, 412, "precondition_failed")
+			return
+		}
+		if t, err := http.ParseTime(r.Header.Get("If-Unmodified-Since")); err == nil && r.Header.Get("If-Match") == "" && fakeModified.After(t) {
+			fail(w, r, 412, "precondition_failed")
+			return
+		}
+		if m := r.Header.Get("If-None-Match"); m != "" && tagListed(m, etag) {
+			w.WriteHeader(304)
+			return
+		}
+		if t, err := http.ParseTime(r.Header.Get("If-Modified-Since")); err == nil && r.Header.Get("If-None-Match") == "" && !fakeModified.After(t) {
+			w.WriteHeader(304)
+			return
+		}
 		w.Header().Set("Content-Type", ct)
-		w.Header().Set("Last-Modified", time.Now().UTC().Format(http.TimeFormat))
 		start, end := int64(0), int64(len(data))-1
 		status := 200
 		if rg := r.Header.Get("Range"); rg != "" {
@@ -176,7 +348,14 @@ func (f *fakeService) object(w http.ResponseWriter, r *http.Request, id, key str
 		}
 	case http.MethodDelete:
 		f.mu.Lock()
+		old, exists := f.objects[id]
+		if writeCondFails(r, exists, `"`+md5hex(old)+`"`) {
+			f.mu.Unlock()
+			fail(w, r, 412, "precondition_failed")
+			return
+		}
 		delete(f.objects, id)
+		delete(f.digests, id)
 		f.mu.Unlock()
 		w.WriteHeader(204)
 	}
@@ -231,7 +410,7 @@ func (f *fakeService) upload(w http.ResponseWriter, r *http.Request, bucket stri
 	up, ok := f.uploads[id]
 	f.mu.Unlock()
 	if !ok {
-		fail(w, 404, "upload_not_found")
+		fail(w, r, 404, "upload_not_found")
 		return
 	}
 	k, _ := base64.RawURLEncoding.DecodeString(strings.Split(id, ".")[0])
@@ -257,16 +436,23 @@ func (f *fakeService) upload(w http.ResponseWriter, r *http.Request, bucket stri
 		json.NewDecoder(r.Body).Decode(&in)
 		var all []byte
 		f.mu.Lock()
+		old, exists := f.objects[bucket+"/"+key]
+		if writeCondFails(r, exists, `"`+md5hex(old)+`"`) {
+			f.mu.Unlock()
+			fail(w, r, 412, "precondition_failed")
+			return
+		}
 		for i, p := range in.Parts {
 			data, ok := up[p.Number]
 			if !ok || md5hex(data) != p.ETag || (i < len(in.Parts)-1 && len(data) < minPartSize) {
 				f.mu.Unlock()
-				fail(w, 400, "invalid_part")
+				fail(w, r, 400, "invalid_part")
 				return
 			}
 			all = append(all, data...)
 		}
 		f.objects[bucket+"/"+key] = all
+		delete(f.digests, bucket+"/"+key) // objects joined from parts have no Repr-Digest
 		delete(f.uploads, id)
 		f.mu.Unlock()
 		writeJSON(w, 200, map[string]any{"key": key, "size": len(all), "etag": "x-" + strconv.Itoa(len(in.Parts))})
