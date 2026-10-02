@@ -100,4 +100,33 @@ func TestIntegration(t *testing.T) {
 	if string(body) != "สวัสดี" {
 		t.Fatalf("link served %q", body)
 	}
+
+	// A public folder: anyone reads it at its public URL, nothing else.
+	if _, err := b.SetPublicAccess(ctx, []PublicRule{{Prefix: "notes/"}}); err != nil {
+		t.Fatal(err)
+	}
+	status := func(u string) int {
+		resp, err := http.Get(u)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	// Gateways see the change within their 15-second cache.
+	for deadline := time.Now().Add(30 * time.Second); status(b.PublicURL("notes/copy.txt")) != http.StatusOK; time.Sleep(time.Second) {
+		if time.Now().After(deadline) {
+			t.Fatal("a public folder is not public")
+		}
+	}
+	if s := status(b.PublicURL("big/file.bin")); s != http.StatusForbidden {
+		t.Fatalf("outside the public folder: %d", s)
+	}
+	anon, _ := New(Config{Endpoint: endpoint})
+	if got, err := anon.Bucket(name).GetBytes(ctx, "notes/ไทย.txt"); err != nil || string(got) != "สวัสดี" {
+		t.Fatalf("anonymous client: %q %v", got, err)
+	}
+	if _, err := b.SetPublicAccess(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
 }

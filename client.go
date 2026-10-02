@@ -32,8 +32,10 @@ import (
 // Version is the SDK version, sent in the User-Agent.
 const Version = "1.0.0"
 
-// Config configures a Client. Endpoint, AccessKeyID and SecretAccessKey are
-// required; every other field has a sensible default.
+// Config configures a Client. Endpoint is required, and AccessKeyID and
+// SecretAccessKey together; without a key the Client is anonymous and can
+// only read (and, where allowed, list) what buckets made public. Every
+// other field has a sensible default.
 type Config struct {
 	// Endpoint is the region's Object Storage endpoint, for example
 	// https://objects.bkk.thailandhosting.com.
@@ -83,8 +85,8 @@ type Client struct {
 
 // New creates a Client.
 func New(cfg Config) (*Client, error) {
-	if cfg.Endpoint == "" || cfg.AccessKeyID == "" || cfg.SecretAccessKey == "" {
-		return nil, errors.New("objectstorage: Endpoint, AccessKeyID and SecretAccessKey are required")
+	if cfg.Endpoint == "" || (cfg.AccessKeyID == "") != (cfg.SecretAccessKey == "") {
+		return nil, errors.New("objectstorage: Endpoint is required, and AccessKeyID and SecretAccessKey together")
 	}
 	u, err := url.Parse(strings.TrimRight(cfg.Endpoint, "/"))
 	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
@@ -246,7 +248,9 @@ func (c *Client) do(ctx context.Context, r request) (*http.Response, error) {
 		for k, v := range r.header {
 			req.Header[k] = v
 		}
-		req.Header.Set("Authorization", "Bearer "+c.keyID+":"+c.secret)
+		if c.keyID != "" {
+			req.Header.Set("Authorization", "Bearer "+c.keyID+":"+c.secret)
+		}
 		req.Header.Set("User-Agent", c.userAgent)
 		resp, err := c.http.Do(req)
 		canRetry := attempt < c.retries && ctx.Err() == nil

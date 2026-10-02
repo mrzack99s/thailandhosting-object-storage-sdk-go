@@ -32,15 +32,16 @@ type fakeService struct {
 	objects   map[string][]byte // bucket/key
 	types     map[string]string
 	uploads   map[string]map[int][]byte
-	flaky     atomic.Int32 // answer 503 to this many requests first
-	corrupt   atomic.Bool  // store one byte wrong
+	public    map[string][]PublicRule // bucket: what anyone may read
+	flaky     atomic.Int32            // answer 503 to this many requests first
+	corrupt   atomic.Bool             // store one byte wrong
 	inflight  atomic.Int32
 	maxFlight atomic.Int32
 	requests  atomic.Int32
 }
 
 func newFake() *fakeService {
-	return &fakeService{objects: map[string][]byte{}, types: map[string]string{}, uploads: map[string]map[int][]byte{}}
+	return &fakeService{objects: map[string][]byte{}, types: map[string]string{}, uploads: map[string]map[int][]byte{}, public: map[string][]PublicRule{}}
 }
 
 func md5hex(b []byte) string { s := md5.Sum(b); return hex.EncodeToString(s[:]) }
@@ -65,7 +66,7 @@ func (f *fakeService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
-	if r.Header.Get("Authorization") != "Bearer KEY:SECRET" {
+	if r.Header.Get("Authorization") != "Bearer KEY:SECRET" && !f.publicRead(r) {
 		fail(w, 401, "unauthorized")
 		return
 	}
@@ -83,11 +84,43 @@ func (f *fakeService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.object(w, r, bucket+"/"+key, key)
 	case len(parts) == 2 && parts[1] == "objects":
 		f.list(w, r, bucket)
+	case len(parts) == 2 && parts[1] == "public":
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if r.Method == http.MethodPut {
+			var in struct {
+				Rules []PublicRule `json:"rules"`
+			}
+			json.NewDecoder(r.Body).Decode(&in)
+			f.public[bucket] = in.Rules
+		}
+		writeJSON(w, 200, map[string]any{"rules": f.public[bucket]})
 	case len(parts) >= 2 && parts[1] == "uploads":
 		f.upload(w, r, bucket, parts)
 	default:
 		fail(w, 404, "not_found")
 	}
+}
+
+// publicRead reports an unsigned GET or HEAD of an object a bucket made
+// public.
+func (f *fakeService) publicRead(r *http.Request) bool {
+	if r.Header.Get("Authorization") != "" || r.Method != http.MethodGet && r.Method != http.MethodHead {
+		return false
+	}
+	parts := strings.SplitN(strings.TrimPrefix(r.URL.EscapedPath(), "/v1/buckets/"), "/", 3)
+	if len(parts) != 3 || parts[1] != "objects" {
+		return false
+	}
+	key, _ := url.PathUnescape(parts[2])
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, p := range f.public[parts[0]] {
+		if strings.HasPrefix(key, p.Prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func (f *fakeService) object(w http.ResponseWriter, r *http.Request, id, key string) {
@@ -455,5 +488,47 @@ func TestIterateWithoutRangeFunc(t *testing.T) {
 	}
 	if it.Err() != nil || n != 7 {
 		t.Fatalf("%d objects, %v", n, it.Err())
+	}
+}
+
+func TestPublicAccess(t *testing.T) {
+	f := newFake()
+	srv := httptest.NewServer(f)
+	defer srv.Close()
+	c, err := New(Config{Endpoint: srv.URL, AccessKeyID: "KEY", SecretAccessKey: "SECRET"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	b := c.Bucket("site")
+	for _, key := range []string{"public/a b.txt", "private/x.txt"} {
+		if _, err := b.PutBytes(ctx, key, []byte("hello"), nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rules, err := b.SetPublicAccess(ctx, []PublicRule{{Prefix: "public/"}})
+	if err != nil || len(rules) != 1 || rules[0].Prefix != "public/" {
+		t.Fatalf("set: %v %v", rules, err)
+	}
+	if got, err := b.PublicAccess(ctx); err != nil || len(got) != 1 {
+		t.Fatalf("get: %v %v", got, err)
+	}
+	if got, want := b.PublicURL("public/a b.txt"), srv.URL+"/site/public/a%20b.txt"; got != want {
+		t.Fatalf("PublicURL %q, want %q", got, want)
+	}
+
+	// Without a key the client reads what is public, nothing else.
+	anon, err := New(Config{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if data, err := anon.Bucket("site").GetBytes(ctx, "public/a b.txt"); err != nil || string(data) != "hello" {
+		t.Fatalf("anonymous public read: %q %v", data, err)
+	}
+	if _, err := anon.Bucket("site").GetBytes(ctx, "private/x.txt"); err == nil {
+		t.Fatal("anonymous read of a private object")
+	}
+	if _, err := New(Config{Endpoint: srv.URL, AccessKeyID: "KEY"}); err == nil {
+		t.Fatal("a key without its secret was accepted")
 	}
 }

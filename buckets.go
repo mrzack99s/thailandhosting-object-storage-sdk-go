@@ -12,6 +12,17 @@ type BucketInfo struct {
 	Name      string    `json:"name"`
 	Region    string    `json:"region"`
 	CreatedAt time.Time `json:"createdAt"`
+	// Public is what anyone may read; GetBucket fills it, ListBuckets
+	// does not.
+	Public []PublicRule `json:"public,omitempty"`
+}
+
+// PublicRule makes the objects under Prefix ("" is the whole bucket)
+// readable by anyone without a key, at Bucket.PublicURL. List also lets
+// anyone list those keys.
+type PublicRule struct {
+	Prefix string `json:"prefix"`
+	List   bool   `json:"list"`
 }
 
 // ListBuckets returns the buckets the access key can use.
@@ -62,3 +73,34 @@ type Bucket struct {
 
 // Name is the bucket's name.
 func (b *Bucket) Name() string { return b.name }
+
+// PublicAccess returns what anyone may read in the bucket.
+func (b *Bucket) PublicAccess(ctx context.Context) ([]PublicRule, error) {
+	var out struct {
+		Rules []PublicRule `json:"rules"`
+	}
+	err := b.c.doJSON(ctx, http.MethodGet, b.path+"/public", nil, nil, &out, false)
+	return out.Rules, err
+}
+
+// SetPublicAccess replaces what anyone may read in the bucket: no rules
+// make it private again, PublicRule{} opens all of it, PublicRule{Prefix:
+// "images/"} one folder. It needs a key allowed to manage buckets, and
+// takes effect within about 15 seconds. It returns the rules as stored.
+func (b *Bucket) SetPublicAccess(ctx context.Context, rules []PublicRule) ([]PublicRule, error) {
+	if rules == nil {
+		rules = []PublicRule{}
+	}
+	in := map[string]any{"rules": rules}
+	var out struct {
+		Rules []PublicRule `json:"rules"`
+	}
+	err := b.c.doJSON(ctx, http.MethodPut, b.path+"/public", nil, in, &out, true)
+	return out.Rules, err
+}
+
+// PublicURL is the address anyone can open key at once its folder (or the
+// bucket) is public. No request is made.
+func (b *Bucket) PublicURL(key string) string {
+	return b.c.endpoint.String() + "/" + url.PathEscape(b.name) + "/" + escapeKey(key)
+}

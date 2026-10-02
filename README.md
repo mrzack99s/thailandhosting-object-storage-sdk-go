@@ -61,6 +61,24 @@ Create access keys in the Console (Object Storage → Access keys). Reuse one
 `Client` for the life of your program: it keeps connections open and is
 safe for concurrent use.
 
+## Public buckets and folders
+
+```go
+// Anyone may read images/ (and nothing else) without a key; needs a key
+// allowed to manage buckets. nil makes the bucket private again.
+bucket.SetPublicAccess(ctx, []objectstorage.PublicRule{{Prefix: "images/"}})
+fmt.Println(bucket.PublicURL("images/logo.png"))
+// https://objects.bkk.thailandhosting.com/my-bucket/images/logo.png
+
+// A client without a key reads (and, where allowed, lists) public objects,
+// with the same parallel downloads.
+anon, _ := objectstorage.New(objectstorage.Config{Endpoint: "https://objects.bkk.thailandhosting.com"})
+data, _ := anon.Bucket("my-bucket").GetBytes(ctx, "images/logo.png")
+```
+
+What a key may do (buckets, folders, read / list / write / delete,
+managing buckets, an expiry date) is set on the key in the Console.
+
 ## Performance
 
 |               |                                                                                                                                                                                          |
@@ -102,6 +120,7 @@ size.
 | `Head`, `Exists`, `Delete`, `DeleteMany`, `Copy`     | object operations                                                                      |
 | `List`, `Objects`, `Iterate`                          | one page / a `range` iterator (Go 1.23) / a `Next()` iterator                        |
 | `CreateLink`                                         | a download or upload link that needs no key                                            |
+| `PublicAccess`, `SetPublicAccess`, `PublicURL`       | make the bucket or some folders readable by anyone, and their URLs                     |
 | `CreateMultipartUpload`, `ResumeMultipartUpload`     | do-it-yourself multipart: `UploadPart`, `UploadPartFrom`, `Parts`, `Complete`, `Abort` |
 
 Errors from the service are `*objectstorage.Error` with `StatusCode`,
