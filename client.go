@@ -34,9 +34,9 @@ import (
 const Version = "1.0.0"
 
 // Config configures a Client. Endpoint is required, and AccessKeyID and
-// SecretAccessKey together; without a key the Client is anonymous and can
-// only read (and, where allowed, list) what buckets made public. Every
-// other field has a sensible default.
+// SecretAccessKey together, or TokenSource instead of them; with neither the
+// Client is anonymous and can only read (and, where allowed, list) what
+// buckets made public. Every other field has a sensible default.
 type Config struct {
 	// Endpoint is the region's Object Storage endpoint, for example
 	// https://objects.bkk.thailandhosting.com.
@@ -45,6 +45,13 @@ type Config struct {
 	// SecretAccessKey signs every request (HTTP Message Signatures, RFC
 	// 9421, HMAC-SHA256); it is never sent.
 	SecretAccessKey string
+	// TokenSource, instead of an access key, gives a service account's
+	// short-lived token, sent as Authorization: Bearer with no signature. It
+	// is called before every attempt, retries included, and for parts and
+	// ranges at the same time, so it should cache and refresh the token and
+	// be safe for concurrent use. Its failure is returned wrapping
+	// ErrTokenSource and is not retried. CreateLink needs an access key.
+	TokenSource func(ctx context.Context) (string, error)
 
 	// HTTPClient replaces the default client (a pooled, HTTP/2-capable
 	// transport). It should not set an overall Timeout: large transfers
@@ -78,6 +85,7 @@ type Client struct {
 	endpoint  *url.URL
 	keyID     string
 	secret    string
+	tokens    func(ctx context.Context) (string, error)
 	http      *http.Client
 	retries   int
 	partSize  int64
@@ -91,12 +99,15 @@ func New(cfg Config) (*Client, error) {
 	if cfg.Endpoint == "" || (cfg.AccessKeyID == "") != (cfg.SecretAccessKey == "") {
 		return nil, errors.New("objectstorage: Endpoint is required, and AccessKeyID and SecretAccessKey together")
 	}
+	if cfg.TokenSource != nil && cfg.AccessKeyID != "" {
+		return nil, errors.New("objectstorage: give an access key or TokenSource, not both")
+	}
 	u, err := url.Parse(strings.TrimRight(cfg.Endpoint, "/"))
 	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
 		return nil, fmt.Errorf("objectstorage: invalid Endpoint %q", cfg.Endpoint)
 	}
 	u.Path = strings.TrimSuffix(u.Path, "/v1")
-	c := &Client{endpoint: u, keyID: cfg.AccessKeyID, secret: cfg.SecretAccessKey, http: cfg.HTTPClient,
+	c := &Client{endpoint: u, keyID: cfg.AccessKeyID, secret: cfg.SecretAccessKey, tokens: cfg.TokenSource, http: cfg.HTTPClient,
 		retries: cfg.MaxRetries, partSize: cfg.PartSize, threshold: cfg.MultipartThreshold, workers: cfg.Concurrency}
 	if c.http == nil {
 		c.http = &http.Client{Transport: defaultTransport()}
@@ -135,6 +146,16 @@ func defaultTransport() *http.Transport {
 	t.ReadBufferSize = 256 << 10
 	return t
 }
+
+// ErrTokenSource is wrapped by the error of a call whose Config.TokenSource
+// failed or gave no token: nothing was sent. The source's own error is
+// wrapped too.
+var ErrTokenSource = errors.New("objectstorage: token source failed")
+
+// ErrLinkNeedsAccessKey is returned by CreateLink on a Client with a
+// Config.TokenSource: a link is signed with an access key's secret, and a
+// service account has none.
+var ErrLinkNeedsAccessKey = errors.New("objectstorage: CreateLink needs an access key: a link is signed with the key's secret, and a service account has none")
 
 // Error is an error answer from the service, read from its Problem
 // Details (RFC 9457).
@@ -246,6 +267,17 @@ func sleep(ctx context.Context, d time.Duration) error {
 // body (the caller closes it).
 func (c *Client) do(ctx context.Context, r request) (*http.Response, error) {
 	for attempt := 0; ; attempt++ {
+		var token string
+		if c.tokens != nil {
+			// Asked for on every attempt: a retry picks up a refreshed token.
+			var err error
+			if token, err = c.tokens(ctx); err != nil {
+				return nil, fmt.Errorf("%w: %w", ErrTokenSource, err)
+			}
+			if token == "" {
+				return nil, fmt.Errorf("%w: it gave no token", ErrTokenSource)
+			}
+		}
 		var body io.Reader
 		if r.body != nil {
 			b, err := r.body()
@@ -271,7 +303,9 @@ func (c *Client) do(ctx context.Context, r request) (*http.Response, error) {
 			req.Header.Set("Content-Digest", r.digest)
 		}
 		req.Header.Set("User-Agent", c.userAgent)
-		if c.keyID != "" {
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		} else if c.keyID != "" {
 			// Signed afresh on every attempt: created must be recent.
 			signRequest(req, c.keyID, c.secret, time.Now())
 		}

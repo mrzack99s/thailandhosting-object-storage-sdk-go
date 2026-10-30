@@ -172,7 +172,9 @@ func (f *fakeService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Header.Get("Authorization") != "" {
 		f.bearer.Store(true)
 	}
-	if r.Header.Get("Signature-Input") != "" {
+	if strings.HasPrefix(r.Header.Get("Authorization"), "Bearer tok-") {
+		// A service account's token.
+	} else if r.Header.Get("Signature-Input") != "" {
 		if why := verifySignature(r, time.Now()); why != "" {
 			w.Header().Set("Accept-Signature", `th=("@method" "@authority" "@path" "@query" "content-digest");alg="hmac-sha256"`)
 			fail(w, r, 401, "invalid_signature")

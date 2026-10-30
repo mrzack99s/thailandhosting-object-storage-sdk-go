@@ -460,8 +460,12 @@ type Link struct {
 }
 
 // CreateLink makes a link to download (or upload) one object without an
-// access key, for browsers, other people or another service.
+// access key, for browsers, other people or another service. It needs a
+// Client with an access key (ErrLinkNeedsAccessKey).
 func (b *Bucket) CreateLink(ctx context.Context, key string, opts *LinkOptions) (*Link, error) {
+	if b.c.tokens != nil {
+		return nil, ErrLinkNeedsAccessKey
+	}
 	in := map[string]any{"key": key}
 	if opts != nil {
 		if opts.Expires > 0 {

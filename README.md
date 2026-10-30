@@ -26,7 +26,7 @@ import (
 
 func main() {
 	client, err := objectstorage.New(objectstorage.Config{
-		Endpoint:        "https://objects.bkk.thailandhosting.com",
+		Endpoint:        "https://objects.thailandhosting.com/th-bkk-1",
 		AccessKeyID:     os.Getenv("TH_ACCESS_KEY_ID"),
 		SecretAccessKey: os.Getenv("TH_SECRET_ACCESS_KEY"),
 	})
@@ -75,6 +75,32 @@ Signatures are valid for 5 minutes around the service's clock, so keep the
 machine's time synchronised (NTP); every retry is signed afresh. A client
 without a key sends no signature and reads only what buckets made public.
 
+## Using a service account
+
+A program can use a service account's short-lived token instead of an access
+key. Get it with the identity SDK and pass `TokenSource` in place of the key:
+
+```go
+import identity "github.com/mrzack99s/thailandhosting-identity-sdk-go"
+
+cred, _ := identity.Default()
+client, err := objectstorage.New(objectstorage.Config{
+	Endpoint:    "https://objects.thailandhosting.com/th-bkk-1",
+	TokenSource: cred.TokenSource(""),
+})
+```
+
+The account needs a grant on the bucket, set in the Console. Creating and
+deleting buckets and changing public access take an access key allowed to
+manage buckets.
+
+`TokenSource` is called before every attempt, so a refreshed token is picked
+up, and for parts and ranges at the same time. Give a key or a token source,
+not both. If it fails, nothing is sent or retried: the call returns an error
+wrapping `ErrTokenSource`. Large uploads and downloads work as with a key.
+`CreateLink` needs an access key, because a link is signed with the key's
+secret, and returns `ErrLinkNeedsAccessKey` with a token. `PublicURL` works.
+
 ## Public buckets and folders
 
 ```go
@@ -82,11 +108,11 @@ without a key sends no signature and reads only what buckets made public.
 // allowed to manage buckets. nil makes the bucket private again.
 bucket.SetPublicAccess(ctx, []objectstorage.PublicRule{{Prefix: "images/"}})
 fmt.Println(bucket.PublicURL("images/logo.png"))
-// https://objects.bkk.thailandhosting.com/my-bucket/images/logo.png
+// https://objects.thailandhosting.com/th-bkk-1/my-bucket/images/logo.png
 
 // A client without a key reads (and, where allowed, lists) public objects,
 // with the same parallel downloads.
-anon, _ := objectstorage.New(objectstorage.Config{Endpoint: "https://objects.bkk.thailandhosting.com"})
+anon, _ := objectstorage.New(objectstorage.Config{Endpoint: "https://objects.thailandhosting.com/th-bkk-1"})
 data, _ := anon.Bucket("my-bucket").GetBytes(ctx, "images/logo.png")
 ```
 
@@ -193,6 +219,6 @@ runs against an in-memory fake of the service. To also run against a real
 endpoint (it creates and deletes a bucket):
 
 ```
-TH_OBJECT_STORAGE_ENDPOINT=https://objects.bkk.thailandhosting.com \
+TH_OBJECT_STORAGE_ENDPOINT=https://objects.thailandhosting.com/th-bkk-1 \
 TH_ACCESS_KEY_ID=... TH_SECRET_ACCESS_KEY=... go test -run Integration -v ./...
 ```

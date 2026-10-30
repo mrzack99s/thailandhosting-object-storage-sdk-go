@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -368,5 +370,120 @@ func TestReprDigestVerification(t *testing.T) {
 	f.badRepr.Store(true)
 	if _, err := b.DownloadFile(ctx, "big", dst+"2"); !errors.Is(err, ErrDigestMismatch) {
 		t.Fatalf("damaged parallel download accepted: %v", err)
+	}
+}
+
+// newTokenClient is newRecordedClient with a token source instead of a key.
+func newTokenClient(t *testing.T, f *fakeService, source func(context.Context) (string, error)) (*Client, *recorder) {
+	t.Helper()
+	rec := &recorder{next: f}
+	srv := httptest.NewServer(rec)
+	t.Cleanup(srv.Close)
+	c, err := New(Config{Endpoint: srv.URL, TokenSource: source, PartSize: minPartSize, Concurrency: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c, rec
+}
+
+// TestTokenSource sends a fresh token on every attempt, with no signature,
+// through small and multipart uploads and parallel downloads.
+func TestTokenSource(t *testing.T) {
+	f := newFake()
+	var calls atomic.Int32
+	c, rec := newTokenClient(t, f, func(context.Context) (string, error) {
+		return fmt.Sprintf("tok-%d", calls.Add(1)), nil
+	})
+	ctx := context.Background()
+	b := c.Bucket("b")
+	f.flaky.Store(1)
+	if _, err := b.PutBytes(ctx, "small", []byte("data"), nil); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 2 || len(rec.seen) != 2 || rec.seen[0].Get("Authorization") != "Bearer tok-1" || rec.seen[1].Get("Authorization") != "Bearer tok-2" {
+		t.Fatalf("%d tokens, %d requests: %v", calls.Load(), len(rec.seen), rec.seen)
+	}
+	data := randomData(12 << 20)
+	if _, err := b.Upload(ctx, "big", bytes.NewReader(data), int64(len(data)), nil); err != nil {
+		t.Fatal(err)
+	}
+	var parts int
+	for _, p := range rec.paths {
+		if strings.Contains(p, "/parts/") {
+			parts++
+		}
+	}
+	if parts != 3 {
+		t.Fatalf("%d parts: %v", parts, rec.paths)
+	}
+	path := filepath.Join(t.TempDir(), "big")
+	if _, err := b.DownloadFile(ctx, "big", path); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, data) {
+		t.Fatalf("download: %d bytes, %v", len(got), err)
+	}
+	if int(calls.Load()) != len(rec.seen) {
+		t.Fatalf("%d tokens for %d requests", calls.Load(), len(rec.seen))
+	}
+	for i, h := range rec.seen {
+		if !strings.HasPrefix(h.Get("Authorization"), "Bearer tok-") || h.Get("Signature") != "" || h.Get("Signature-Input") != "" {
+			t.Fatalf("%s: %v", rec.paths[i], h)
+		}
+	}
+}
+
+// TestTokenSourceFailure sends nothing and retries nothing.
+func TestTokenSourceFailure(t *testing.T) {
+	f := newFake()
+	boom := errors.New("boom")
+	var calls atomic.Int32
+	c, rec := newTokenClient(t, f, func(context.Context) (string, error) {
+		calls.Add(1)
+		return "", boom
+	})
+	ctx := context.Background()
+	if _, err := c.Bucket("b").PutBytes(ctx, "k", []byte("data"), nil); !errors.Is(err, ErrTokenSource) || !errors.Is(err, boom) {
+		t.Fatal(err)
+	}
+	if calls.Load() != 1 || len(rec.seen) != 0 {
+		t.Fatalf("%d calls, %d requests", calls.Load(), len(rec.seen))
+	}
+	empty, rec := newTokenClient(t, f, func(context.Context) (string, error) { return "", nil })
+	if _, err := empty.ListBuckets(ctx); !errors.Is(err, ErrTokenSource) || len(rec.seen) != 0 {
+		t.Fatalf("an empty token: %v, %d requests", err, len(rec.seen))
+	}
+}
+
+func TestCreateLinkNeedsAccessKey(t *testing.T) {
+	c, rec := newTokenClient(t, newFake(), func(context.Context) (string, error) { return "tok-1", nil })
+	if _, err := c.Bucket("b").CreateLink(context.Background(), "k", nil); !errors.Is(err, ErrLinkNeedsAccessKey) {
+		t.Fatal(err)
+	}
+	if len(rec.seen) != 0 {
+		t.Fatal("a request was sent")
+	}
+	if got, want := c.Bucket("b").PublicURL("k"), c.endpoint.String()+"/b/k"; got != want {
+		t.Fatalf("PublicURL %q", got)
+	}
+}
+
+// TestCredentialsAreExclusive: both are refused. Neither is the anonymous
+// client of public buckets (TestPublicAccess), which sends no credentials.
+func TestCredentialsAreExclusive(t *testing.T) {
+	source := func(context.Context) (string, error) { return "tok-1", nil }
+	for _, cfg := range []Config{
+		{Endpoint: "https://x", AccessKeyID: "k", SecretAccessKey: "s", TokenSource: source},
+		{Endpoint: "https://x", AccessKeyID: "k", TokenSource: source},
+		{Endpoint: "https://x", SecretAccessKey: "s", TokenSource: source},
+		{Endpoint: "https://x", AccessKeyID: "k"},
+		{TokenSource: source},
+	} {
+		if _, err := New(cfg); err == nil {
+			t.Fatalf("accepted key %q, secret %q, source %v", cfg.AccessKeyID, cfg.SecretAccessKey, cfg.TokenSource != nil)
+		}
+	}
+	if _, err := New(Config{Endpoint: "https://x", TokenSource: source}); err != nil {
+		t.Fatal(err)
 	}
 }
